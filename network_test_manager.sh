@@ -355,160 +355,6 @@ analyze_detection_result() {
     echo "$high_latency_lines"
 }
 
-# 功能5：检测短时间内的重复数据包
-detect_duplicate_packets() {
-    echo -e "${GREEN}=== 功能5：检测短时间内的重复数据包 ===${NC}"
-    
-    if ! command -v tcpdump &> /dev/null; then
-        echo -e "${RED}错误：未找到tcpdump命令，请先安装tcpdump${NC}"
-        return 1
-    fi
-    
-    if [ "$(id -u)" != "0" ]; then
-        echo -e "${RED}错误：tcpdump需要root权限才能捕获数据包，请使用sudo运行${NC}"
-        return 1
-    fi
-    
-    echo -e "${YELLOW}可用的网络接口：${NC}"
-    interfaces=$(ip link show | grep -E '^[0-9]+:' | awk '{print $2}' | sed 's/:$//')
-    echo "$interfaces"
-    
-    read -p "请输入要监听的网络接口（不输入则自动选择）: " interface
-    if [ -z "$interface" ]; then
-        interface=$(ip route | grep default | awk '{print $5}' | head -n 1)
-        if [ -z "$interface" ]; then
-            interface="eth0"
-        fi
-        echo -e "${YELLOW}自动选择网络接口：${interface}${NC}"
-    fi
-    
-    read -p "请输入要检测的来源IP（不输入则检测所有来源）: " source_ip
-    
-    read -p "请输入检测时间（秒，默认10秒）: " detect_time
-    if [ -z "$detect_time" ] || ! grep -qE '^[0-9]+$' <<< "$detect_time"; then
-        detect_time=10
-    fi
-    
-    read -p "请输入重复阈值（次，默认5次）: " threshold
-    if [ -z "$threshold" ] || ! grep -qE '^[0-9]+$' <<< "$threshold"; then
-        threshold=5
-    fi
-    
-    capture_file="${LOG_DIR}/packet_capture_$(get_current_datetime).log"
-    error_file="${LOG_DIR}/tcpdump_error_$(get_current_datetime).log"
-    echo -e "${YELLOW}正在捕获${detect_time}秒内的数据包...${NC}"
-    echo -e "${YELLOW}监听接口：${interface}${NC}"
-    echo -e "${YELLOW}抓包文件将保存到：${capture_file}${NC}"
-    
-    if [ -n "$source_ip" ]; then
-        tcpdump -i "$interface" -nn -t -q -c 500 src "$source_ip" > "$capture_file" 2>"$error_file" &
-    else
-        tcpdump -i "$interface" -nn -t -q -c 500 > "$capture_file" 2>"$error_file" &
-    fi
-    
-    tcpdump_pid=$!
-    echo -e "${YELLOW}tcpdump进程PID：${tcpdump_pid}${NC}"
-    
-    sleep "$detect_time"
-    kill -SIGINT "$tcpdump_pid" 2>/dev/null
-    wait "$tcpdump_pid" 2>/dev/null
-    
-    if [ ! -s "$capture_file" ]; then
-        echo -e "${RED}抓包文件为空！可能原因：${NC}"
-        echo -e "${RED}1. 网络接口选择错误${NC}"
-        echo -e "${RED}2. 当前网络没有流量${NC}"
-        echo -e "${RED}3. tcpdump权限不足${NC}"
-        rm -f "$capture_file"
-        rm -f "$error_file"
-        return 1
-    fi
-    
-    echo -e "\n${GREEN}=== 数据包统计分析 ===${NC}"
-    parsed_data=$(awk '{print $2" "$4" "$5}' "$capture_file")
-    echo "$parsed_data" | sort | uniq -c | sort -nr
-    
-    echo -e "\n${GREEN}=== 重复次数超过${threshold}次的数据包 ===${NC}"
-    duplicate_packets=$(echo "$parsed_data" | sort | uniq -c | awk -v threshold="$threshold" '$1 > threshold')
-    
-    if [ -n "$duplicate_packets" ]; then
-        echo "$duplicate_packets" | while read -r count src dst proto; do
-            if [ "$proto" = ":" ]; then
-                proto=""
-            fi
-            echo -e "${RED}重复${count}次: ${src} -> ${dst} ${proto}${NC}"
-        done
-    else
-        echo -e "${GREEN}未发现重复次数超过${threshold}次的数据包${NC}"
-    fi
-    
-    echo -e "\n${GREEN}抓包文件已保存至：${capture_file}${NC}"
-    rm -f "$error_file"
-}
-
-# 功能6：检测TIME_WAIT进程并优化
-detect_time_wait() {
-    echo -e "${GREEN}=== 功能6：网络进程优化检测 ===${NC}"
-    
-    if [ "$(id -u)" != "0" ]; then
-        echo -e "${RED}错误：此功能需要root权限，请使用sudo运行${NC}"
-        return 1
-    fi
-    
-    time_wait_count=$(netstat -antp 2>/dev/null | grep -c TIME_WAIT)
-    
-    echo -e "${YELLOW}当前TIME_WAIT连接数：${time_wait_count}${NC}"
-    
-    if [ "$time_wait_count" -gt 10 ]; then
-        echo -e "${RED}警告：TIME_WAIT连接数过多，需要优化${NC}"
-        
-        read -p "是否优化sysctl.conf参数？(y/n): " choice
-        if [ "$choice" != "y" ] && [ "$choice" != "Y" ]; then
-            echo -e "${RED}已取消操作${NC}"
-            return 1
-        fi
-        
-        sysctl_conf="/etc/sysctl.conf"
-        
-        if [ -f "$sysctl_conf" ]; then
-            cp "$sysctl_conf" "${sysctl_conf}.bak"
-            echo -e "${YELLOW}已备份原配置文件为 ${sysctl_conf}.bak${NC}"
-        fi
-        
-        echo -e "${YELLOW}正在优化sysctl.conf参数...${NC}"
-        
-        sysctl_params=(
-            "net.ipv4.tcp_syncookies = 1"
-            "net.ipv4.tcp_tw_reuse = 1"
-            "net.ipv4.tcp_tw_recycle = 1"
-            "net.ipv4.tcp_max_tw_buckets = 0"
-            "net.ipv4.neigh.default.gc_stale_time = 1000"
-            "net.ipv4.neigh.default.gc_thresh1 = 1024"
-            "net.ipv4.neigh.default.gc_thresh2 = 2028"
-            "net.ipv4.neigh.default.gc_thresh3 = 10240"
-        )
-        
-        for param in "${sysctl_params[@]}"; do
-            param_name=$(echo "$param" | awk '{print $1}')
-            grep -q "^$param_name" "$sysctl_conf" 2>/dev/null
-            if [ $? -eq 0 ]; then
-                sed -i "s|^$param_name.*|$param|" "$sysctl_conf"
-            else
-                echo "$param" >> "$sysctl_conf"
-            fi
-        done
-        
-        echo -e "${YELLOW}正在应用sysctl配置...${NC}"
-        sysctl -p 2>/dev/null
-        
-        echo -e "${GREEN}sysctl参数优化完成${NC}"
-        
-        new_time_wait_count=$(netstat -antp 2>/dev/null | grep -c TIME_WAIT)
-        echo -e "${GREEN}优化后TIME_WAIT连接数：${new_time_wait_count}${NC}"
-    else
-        echo -e "${GREEN}网络进程正常，无需优化${NC}"
-    fi
-}
-
 # 功能4：清理历史检测进程
 cleanup_processes() {
     echo -e "${GREEN}=== 功能4：清理历史检测进程 ===${NC}"
@@ -564,9 +410,7 @@ display_menu() {
     echo -e "${YELLOW}2. 查看网络检测结果（结束后台常ping并分析波动情况）${NC}"
     echo -e "${YELLOW}3. 分析网络检测结果（根据延迟阈值查找异常记录）${NC}"
     echo -e "${YELLOW}4. 清理历史检测进程（结束所有后台常ping进程）${NC}"
-    echo -e "${YELLOW}5. 检测重复数据包（短时间内来源、IP、端口、协议相同的包）${NC}"
-    echo -e "${YELLOW}6. 网络进程优化检测（菜单卡顿、业务运行卡顿可尝试）${NC}"
-    echo -e "${YELLOW}7. 退出程序（配置好后台常ping后请按7结束哦）${NC}"
+    echo -e "${YELLOW}5. 退出程序（配置好后台常ping后请按5结束哦）${NC}"
     echo -e "${PURPLE}=====================================${NC}"
     echo -e "${ORANGE}使用遇到问题请联系赵炳翔${NC}"
     echo -e "${ORANGE}说明：本工具适用于需要长期监测网络的情况，如在半夜或者偶尔掉线的设备，你不用再半夜或者盯着电脑屏幕去测试网络了，让我在后台帮你看着，你醒来我告诉你结果${NC}"
@@ -581,7 +425,7 @@ main() {
         display_menu
         
         # 读取用户选择
-        read -p "请输入功能编号 (1-7): " choice
+        read -p "请输入功能编号 (1-5): " choice
         
         case "$choice" in
             1)
@@ -597,17 +441,11 @@ main() {
                 cleanup_processes
                 ;;
             5)
-                detect_duplicate_packets
-                ;;
-            6)
-                detect_time_wait
-                ;;
-            7)
                 echo -e "${GREEN}感谢使用网络检测管理系统，再见！${NC}"
                 exit 0
                 ;;
             *)
-                echo -e "${RED}错误：无效的功能编号！请输入1-7之间的数字${NC}"
+                echo -e "${RED}错误：无效的功能编号！请输入1-5之间的数字${NC}"
                 ;;
         esac
         
